@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 *_result.json
 codearts_credentials.json
+codearts_welfare_ledger.json

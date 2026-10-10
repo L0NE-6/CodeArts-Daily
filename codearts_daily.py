@@ -4,11 +4,15 @@
 ------------------------------------------------------------
 
 📌 功能
-   CodeArts 每日福利（不是签到，是 ops 交付三步式）：
+   CodeArts 每日福利 + 新人注册礼（不是签到，是 ops 交付三步式）：
    1. GET  {base}/v1/ops/delivery?channel=IDE   读活动列表（只读）
-   2. POST {base}/v1/ops/claim                   领取 USER_LOGIN + CREDIT 类活动
+   2. POST {base}/v1/ops/claim                   领取 USER_LOGIN / NEW_USER_REGISTER 类活动
    3. POST {base}/v1/ops/confirm                 确认到账
    4. GET  delivery 回读，状态变 CONFIRMED/CONSUMED 才算成功
+
+   · 新人注册礼是一次性奖励，与每日福利共用同一套领取执行体；学生认证 / 邀请好友不自动领；
+   · 幂等键先落盘再发写请求，本地台账限制每天最多 6 次写尝试、间隔 10 分钟（--force 可跳过）；
+   · 活动标题按活动类映射中文；查询与回读同源，避免「受理了但没到账」被当成成功。
 
    base = https://snap-access.cn-north-4.myhuaweicloud.com
    请求使用华为云 SDK-HMAC-SHA256 签名（AK/SK/STS，区域 API 不带 Host）。
@@ -36,6 +40,7 @@
    python codearts_daily.py               领取每日福利
    python codearts_daily.py --preview     只读活动列表，不发写请求
    python codearts_daily.py --only 2      只跑第 2 个账号
+   python codearts_daily.py --force       忽略本地写请求限流（当天最多 6 次 / 间隔 10 分钟）
    python codearts_daily.py --no-notify   不推送
 
 📄 依赖：requests（自动续期另需 cryptography）
@@ -70,10 +75,16 @@ REFRESH_LEAD_SECONDS = 15 * 60
 SIGN_ALGORITHM = "SDK-HMAC-SHA256"
 EMPTY_BODY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 STORE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "codearts_credentials.json")
+LEDGER_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "codearts_welfare_ledger.json")
+LEDGER_VERSION = 2
+MAX_ATTEMPTS_PER_DAY = 6
+MIN_ATTEMPT_GAP_SECONDS = 10 * 60
+BEIJING_OFFSET_SECONDS = 8 * 60 * 60
 
 ONLY = None
 PREVIEW_ONLY = False
 NO_NOTIFY = False
+FORCE = False
 
 
 def log(msg):
@@ -129,6 +140,23 @@ def first_text(*values):
         if isinstance(value, (int, float)):
             return str(value)
     return ""
+
+
+TITLE_BY_TYPE = {
+    "DAILY_CLAIM": "每日签到",
+    "USER_LOGIN": "用户登录送积分",
+    "NEW_USER_REGISTER": "新用户注册礼",
+    "STUDENT_CERTIFIED": "学生认证",
+    "INVITE_USER": "邀请好友",
+}
+
+
+def display_title(campaign):
+    """活动标题按活动类映射中文；认不出的类回退上游原文（再空才回退 type）。"""
+    mapped = TITLE_BY_TYPE.get(campaign.get("type") or "")
+    if mapped:
+        return mapped
+    return (campaign.get("title") or campaign.get("type") or "活动").strip()
 
 
 # ---------- 华为云 SDK-HMAC-SHA256 签名 ----------
@@ -472,9 +500,99 @@ def ensure_fresh(credential):
     return credential
 
 
+# ---------- 本地台账（幂等键 + 写请求限流） ----------
+
+def beijing_day(now_ms=None):
+    """北京时间意义上的「今天」：上游活动周期是 UTC+8 零点。"""
+    moment = (now_ms if now_ms is not None else int(time.time() * 1000)) / 1000.0 + BEIJING_OFFSET_SECONDS
+    return time.strftime("%Y-%m-%d", time.gmtime(moment))
+
+
+def load_ledger_store():
+    try:
+        with open(LEDGER_FILE, encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_ledger_store(store):
+    try:
+        with open(LEDGER_FILE, "w", encoding="utf-8") as handle:
+            json.dump(store, handle, ensure_ascii=False, indent=2)
+        return True
+    except Exception as error:
+        log("⚠️ 领取台账写入失败: %s" % error)
+        return False
+
+
+def fresh_ledger():
+    return {"version": LEDGER_VERSION, "day": beijing_day(), "attempts": 0, "lastAttemptMs": 0,
+            "accepted": False, "campaigns": {}, "newbieSettled": False}
+
+
+def ledger_of(store, identity):
+    """读台账并归一到北京时间「今天」。
+
+    读不懂的台账一律拒绝（版本不对 / 日期越界 / attempts 越界）：当成空台账重来
+    会把上一轮的幂等键丢掉，崩溃后重试会被上游当成另一笔领取。
+    """
+    ledger = fresh_ledger()
+    entry = (store.get("accounts") or {}).get(identity)
+    if not isinstance(entry, dict):
+        return ledger
+    ledger["newbieSettled"] = entry.get("newbieSettled") is True
+    stored = entry.get("ledger")
+    if stored is None:
+        return ledger
+    day = stored.get("day") if isinstance(stored, dict) else None
+    attempts = stored.get("attempts") if isinstance(stored, dict) else None
+    if (not isinstance(stored, dict) or stored.get("version") != LEDGER_VERSION
+            or not isinstance(day, str) or not isinstance(attempts, int)
+            or not 0 <= attempts <= MAX_ATTEMPTS_PER_DAY):
+        raise RuntimeError("本地领取台账无效，未发送领取请求（可删除 codearts_welfare_ledger.json 后重试）")
+    today = beijing_day()
+    if day > today:
+        raise RuntimeError("系统日期（%s）早于领取记录（%s），先纠正时钟再领取" % (today, day))
+    if day < today:
+        return ledger
+    ledger["day"] = day
+    ledger["attempts"] = attempts
+    ledger["lastAttemptMs"] = stored.get("lastAttemptMs") if isinstance(stored.get("lastAttemptMs"), int) else 0
+    ledger["accepted"] = stored.get("accepted") is True
+    campaigns = stored.get("campaigns")
+    if isinstance(campaigns, dict):
+        ledger["campaigns"] = {key: value for key, value in campaigns.items() if isinstance(value, dict)}
+    return ledger
+
+
+def persist_ledger(store, identity, ledger):
+    accounts = store.setdefault("accounts", {})
+    entry = accounts.get(identity)
+    if not isinstance(entry, dict):
+        entry = {}
+    entry["ledger"] = {key: ledger.get(key) for key in (
+        "version", "day", "attempts", "lastAttemptMs", "accepted", "campaigns")}
+    entry["newbieSettled"] = ledger.get("newbieSettled") is True
+    entry["at"] = int(time.time())
+    accounts[identity] = entry
+    if not save_ledger_store(store):
+        raise RuntimeError("领取台账写入失败，为避免重复领取已中止（检查脚本目录写权限）")
+
+
+def gap_remaining_seconds(ledger):
+    last = ledger.get("lastAttemptMs") or 0
+    if not isinstance(last, int) or last <= 0:
+        return 0
+    elapsed = max(0, int(time.time() * 1000) - last)
+    return max(0, MIN_ATTEMPT_GAP_SECONDS - elapsed // 1000)
+
+
 # ---------- ops 请求与领取流程 ----------
 
 def welfare_request(credential, method, path, body=None):
+    """一次 ops 请求：签名 GET/POST + code==0 的 envelope 判定。"""
     url = BASE + path
     headers = {"Content-Type": "application/json", "Agent-Type": "PromptCenter", "X-Language": "en-us"}
     payload = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8") if body is not None else b""
@@ -482,11 +600,20 @@ def welfare_request(credential, method, path, body=None):
     response = request(method, url, headers=signed, data=payload if body is not None else None, timeout=20)
     text = response.text[:300]
     if response.status_code != 200:
-        raise RuntimeError("ops 接口返回 HTTP %s: %s" % (response.status_code, text))
+        raise RuntimeError("ops 接口返回 HTTP %s: %s%s" % (response.status_code, text, benefit_hint(text)))
     parsed = json_of(response)
     if parsed.get("code") != 0:
-        raise RuntimeError("ops 接口未确认成功（需要 code=0，实际 %s）" % parsed.get("code"))
+        raise RuntimeError("ops 接口未确认成功（需要 code=0，实际 %s）%s" % (parsed.get("code"), benefit_hint(text)))
     return parsed.get("data")
+
+
+def benefit_hint(text):
+    """「无福利档案」类报错给一句人话：官方建档后重试即可。"""
+    lowered = (text or "").lower()
+    for token in ("4004", "benefit not found", "档案", "不存在"):
+        if token in lowered:
+            return "（该账号尚未开通福利档案；官方客户端登录/首次使用时会自动建档，稍后重试即可）"
+    return ""
 
 
 def fetch_deliveries(credential):
@@ -502,6 +629,7 @@ def fetch_deliveries(credential):
             "id": item.get("campaignId"),
             "key": str(item.get("campaignId")) if item.get("campaignId") is not None else "",
             "type": item.get("type") or "",
+            "title": item.get("title") or "",
             "claimable": item.get("claimable") is True,
             "status": item.get("status") or "",
             "amount": item.get("benefitAmount") or 0,
@@ -518,48 +646,119 @@ def is_confirmed(campaign):
     return (not campaign["claimable"]) and campaign["status"] in ("CONFIRMED", "CONSUMED")
 
 
-def claim_one(credential, campaign):
-    idempotent_key = "claim_%s_%d" % (campaign["key"], int(time.time() * 1000))
+def is_newbie_gift(campaign):
+    """新人注册礼：一次性奖励，与每日福利共用领取执行体；学生认证 / 邀请好友不自动领。"""
+    return campaign["type"] == "NEW_USER_REGISTER" and bool(campaign["key"])
+
+
+def has_work(campaign):
+    """这一条还有活要干吗（能领，或领了没确认）。"""
+    return campaign["claimable"] or campaign["status"] == "CLAIMED"
+
+
+def claim_one(credential, campaign, idempotent_key):
+    """领一笔（campaignId 原样带回，不改类型）；响应 id 对不上就不进入 confirm 阶段。"""
     data = welfare_request(credential, "POST", CLAIM_PATH,
                            {"campaignId": campaign["id"], "idempotentKey": idempotent_key, "channel": "IDE"})
     returned = str(data.get("campaignId")) if isinstance(data, dict) else ""
     if returned != campaign["key"]:
-        raise RuntimeError("领取响应活动 ID 不匹配（要 %s，回 %s）" % (campaign["key"], returned))
-    welfare_request(credential, "POST", CONFIRM_PATH, {"campaignId": campaign["id"]})
+        raise RuntimeError("领取响应活动 ID 不匹配（要 %s，回 %s），未进入确认阶段" % (campaign["key"], returned))
 
 
 def do_checkin(credential):
     credential = ensure_fresh(credential)
+    identity = identity_of(credential)
+    store = load_ledger_store()
+    ledger = ledger_of(store, identity)
+
     campaigns = fetch_deliveries(credential)
     daily = [item for item in campaigns if is_daily_login(item)]
-    if not daily:
-        return False, "当前没有每日登录类福利活动", credential
-    if all(is_confirmed(item) for item in daily):
-        return False, "今日福利已确认到账", credential
+    newbie = [item for item in campaigns if is_newbie_gift(item)]
 
     if PREVIEW_ONLY:
-        rows = ["%s:%s(%s)" % (item["key"], item["status"], item["amount"]) for item in daily]
-        return False, "仅预览（--preview）: " + "; ".join(rows), credential
+        rows = []
+        for item in daily:
+            rows.append("%s:%s(%s)" % (display_title(item), item["status"] or "可领取", item["amount"]))
+        for item in newbie:
+            state = "已确认" if is_confirmed(item) else (item["status"] or "可领取")
+            rows.append("%s:%s(%s)" % (display_title(item), state, item["amount"]))
+        return False, "仅预览（--preview）: " + ("; ".join(rows) if rows else "当前没有福利活动"), credential
 
-    claimed = 0
-    for campaign in daily:
-        if is_confirmed(campaign):
-            continue
-        if campaign["claimable"]:
-            claim_one(credential, campaign)   # claim + confirm
-            claimed += 1
-        elif campaign["status"] == "CLAIMED":
+    # 新人礼是一次性奖励：结清记本机后不再重查（与每日链共用同一份台账与限流）
+    daily_work = [item for item in daily if has_work(item)]
+    newbie_work = [] if ledger.get("newbieSettled") else [item for item in newbie if has_work(item)]
+    todo = daily_work + newbie_work
+
+    if not todo:
+        if daily and all(is_confirmed(item) for item in daily):
+            extra = "；新人注册礼已确认" if newbie and all(is_confirmed(item) for item in newbie) else ""
+            return False, "今日福利已确认到账" + extra, credential
+        return False, "当前没有可领取的福利活动", credential
+
+    now_ms = int(time.time() * 1000)
+    if not FORCE:
+        if ledger["attempts"] >= MAX_ATTEMPTS_PER_DAY:
+            return False, "本地限流：今日已提交 %d 次，跳过本轮（--force 可强制重试）" % ledger["attempts"], credential
+        wait = gap_remaining_seconds(ledger)
+        if wait > 0:
+            return False, "本地限流：距上次提交不足 10 分钟（约 %d 秒后重试，--force 可跳过）" % wait, credential
+
+    ledger["attempts"] += 1
+    ledger["lastAttemptMs"] = now_ms
+    ledger["accepted"] = False
+    persist_ledger(store, identity, ledger)   # 幂等键先落盘再发写请求
+
+    submitted = []
+    for item in todo:
+        key = item["key"]
+        progress = ledger["campaigns"].get(key) or {}
+        if item["status"] == "CLAIMED":
+            progress["claimed"] = True
+        if not progress.get("claimed") and item["claimable"]:
+            if not progress.get("idempotentKey"):
+                progress["idempotentKey"] = "claim_%s_%d" % (key, now_ms)
+            ledger["campaigns"][key] = progress
+            persist_ledger(store, identity, ledger)
+            claim_one(credential, item, progress["idempotentKey"])
+            progress["claimed"] = True
+            ledger["campaigns"][key] = progress
+            persist_ledger(store, identity, ledger)
+        if progress.get("claimed"):
             # 已领但未确认：只补 confirm，不重复发 claim
-            welfare_request(credential, "POST", CONFIRM_PATH, {"campaignId": campaign["id"]})
-            claimed += 1
+            welfare_request(credential, "POST", CONFIRM_PATH, {"campaignId": item["id"]})
+        submitted.append(item)
         time.sleep(1.0)
 
-    verified = [item for item in fetch_deliveries(credential) if is_daily_login(item)]
-    confirmed = [item for item in verified if is_confirmed(item)]
-    if confirmed and len(confirmed) >= len(verified):
-        total = sum(float(item["amount"] or 0) for item in confirmed)
-        return True, "福利已确认到账：%d 个活动，共 %s（本次提交 %d 笔）" % (len(confirmed), total, claimed)
-    return False, "已提交 %d 笔，但回读未确认到账（上游可能延迟，稍后可重跑）" % claimed, credential
+    # 回读二次确认：claim / confirm 都只回 code:0，那是「受理」不是「到账」
+    verified = fetch_deliveries(credential)
+    missing = []
+    for item in submitted:
+        matched = any(seen["key"] == item["key"] and seen["type"] == item["type"] and is_confirmed(seen)
+                      for seen in verified)
+        if matched:
+            progress = ledger["campaigns"].get(item["key"]) or {}
+            progress["confirmed"] = True
+            ledger["campaigns"][item["key"]] = progress
+        else:
+            missing.append(display_title(item))
+    if missing:
+        persist_ledger(store, identity, ledger)
+        return False, "请求已提交，但官方活动列表尚未确认到账：%s（稍后重跑会补确认）" % "、".join(missing), credential
+
+    ledger["accepted"] = True
+    verified_newbie = [item for item in verified if is_newbie_gift(item)]
+    if verified_newbie and all(is_confirmed(item) for item in verified_newbie):
+        ledger["newbieSettled"] = True   # 一次性福利结清后记本机，下次不再重查
+    persist_ledger(store, identity, ledger)
+
+    parts = []
+    done_daily = [item for item in verified if is_daily_login(item) and is_confirmed(item)]
+    if done_daily:
+        parts.append("每日福利 %s" % sum(float(item["amount"] or 0) for item in done_daily))
+    done_newbie = [item for item in verified_newbie if is_confirmed(item)]
+    if done_newbie:
+        parts.append("新人注册礼 %s" % sum(float(item["amount"] or 0) for item in done_newbie))
+    return True, "福利已确认到账：%s（本次提交 %d 笔）" % ("；".join(parts) or "已确认", len(submitted)), credential
 
 
 # ---------- 推送 ----------
@@ -661,10 +860,12 @@ def notify_all(title, content):
 # ---------- 主流程 ----------
 
 def main():
-    global ONLY, PREVIEW_ONLY, NO_NOTIFY
+    global ONLY, PREVIEW_ONLY, NO_NOTIFY, FORCE
     args = sys.argv[1:]
     if "--preview" in args:
         PREVIEW_ONLY = True
+    if "--force" in args:
+        FORCE = True
     if "--no-notify" in args:
         NO_NOTIFY = True
     if "--only" in args:
