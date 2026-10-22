@@ -1,5 +1,15 @@
 # 更新日志
 
+## v1.0.3（2026-10-22）
+
+- 福利列表与领取渠道从 `IDE` 切换到桌面客户端口径 `DESKTOP`，并按桌面客户端方式签名包含 `Host`。
+- 领取响应改为解析 `userBenefitId` / `user_benefit_id` / `benefitId` / `id`，不再强制要求回传 `campaignId`。
+- 确认请求改为最新合同的 `{"userBenefitId": ...}`；不再用 `campaignId` 冒充确认 ID。
+- 请求头语言改为 `zh-cn`，delivery 请求补充 `x-snap-traceid`；响应兼容 `code=0/200` 与 `data/result`。
+- 新幂等键改为 UUID；旧台账中的 `idempotentKey` 原样复用。台账版本从 v2 自动迁移到 v3。
+- 已领取但缺少 `userBenefitId` 时 fail closed，不重放 claim，不猜测确认 ID。
+- 新增 5 项离线测试，覆盖桌面请求头、claim/confirm 合同、无 campaignId 响应、缺 ID 防误领和台账迁移。
+
 ## v1.0.2（2026-10-10）
 
 - **新人注册礼接入签到链路**：与每日福利共用领取执行体，幂等键先落盘、领取后回读活动列表确认；学生认证 / 邀请好友不提供自动领取入口。

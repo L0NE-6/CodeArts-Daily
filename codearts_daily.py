@@ -5,7 +5,7 @@
 
 📌 功能
    CodeArts 每日福利 + 新人注册礼（不是签到，是 ops 交付三步式）：
-   1. GET  {base}/v1/ops/delivery?channel=IDE   读活动列表（只读）
+   1. GET  {base}/v1/ops/delivery?channel=DESKTOP 读活动列表（只读）
    2. POST {base}/v1/ops/claim                   领取 USER_LOGIN / NEW_USER_REGISTER 类活动
    3. POST {base}/v1/ops/confirm                 确认到账
    4. GET  delivery 回读，状态变 CONFIRMED/CONSUMED 才算成功
@@ -15,7 +15,7 @@
    · 活动标题按活动类映射中文；查询与回读同源，避免「受理了但没到账」被当成成功。
 
    base = https://snap-access.cn-north-4.myhuaweicloud.com
-   请求使用华为云 SDK-HMAC-SHA256 签名（AK/SK/STS，区域 API 不带 Host）。
+    请求使用华为云 SDK-HMAC-SHA256 签名（AK/SK/STS，按桌面客户端口径包含 Host）。
 
 🔑 环境变量
    CODEARTS_CREDENTIALS  【必填】多账号用换行或 & 分隔（JSON 凭据必须每条独占一行；AK|SK|STS 简写可用 & 串接）：
@@ -52,6 +52,7 @@ import json
 import os
 import sys
 import time
+import uuid
 from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
@@ -66,7 +67,8 @@ except Exception:
     pass
 
 BASE = "https://snap-access.cn-north-4.myhuaweicloud.com"
-DELIVERY_PATH = "/v1/ops/delivery?channel=IDE"
+OPS_CHANNEL = "DESKTOP"
+DELIVERY_PATH = "/v1/ops/delivery?channel=" + OPS_CHANNEL
 CLAIM_PATH = "/v1/ops/claim"
 CONFIRM_PATH = "/v1/ops/confirm"
 TOKEN_URL = "https://sts.cn-north-4.myhuaweicloud.com/v1/oauth2/tokens"
@@ -76,7 +78,7 @@ SIGN_ALGORITHM = "SDK-HMAC-SHA256"
 EMPTY_BODY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 STORE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "codearts_credentials.json")
 LEDGER_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "codearts_welfare_ledger.json")
-LEDGER_VERSION = 2
+LEDGER_VERSION = 3
 MAX_ATTEMPTS_PER_DAY = 6
 MIN_ATTEMPT_GAP_SECONDS = 10 * 60
 BEIJING_OFFSET_SECONDS = 8 * 60 * 60
@@ -548,7 +550,7 @@ def ledger_of(store, identity):
         return ledger
     day = stored.get("day") if isinstance(stored, dict) else None
     attempts = stored.get("attempts") if isinstance(stored, dict) else None
-    if (not isinstance(stored, dict) or stored.get("version") != LEDGER_VERSION
+    if (not isinstance(stored, dict) or stored.get("version") not in (2, LEDGER_VERSION)
             or not isinstance(day, str) or not isinstance(attempts, int)
             or not 0 <= attempts <= MAX_ATTEMPTS_PER_DAY):
         raise RuntimeError("本地领取台账无效，未发送领取请求（可删除 codearts_welfare_ledger.json 后重试）")
@@ -558,6 +560,7 @@ def ledger_of(store, identity):
     if day < today:
         return ledger
     ledger["day"] = day
+    ledger["version"] = LEDGER_VERSION
     ledger["attempts"] = attempts
     ledger["lastAttemptMs"] = stored.get("lastAttemptMs") if isinstance(stored.get("lastAttemptMs"), int) else 0
     ledger["accepted"] = stored.get("accepted") is True
@@ -591,20 +594,33 @@ def gap_remaining_seconds(ledger):
 
 # ---------- ops 请求与领取流程 ----------
 
-def welfare_request(credential, method, path, body=None):
-    """一次 ops 请求：签名 GET/POST + code==0 的 envelope 判定。"""
+def welfare_request(credential, method, path, body=None, extra_headers=None):
+    """一次 ops 请求：按桌面客户端签名并解析 code=0/200 的 envelope。"""
     url = BASE + path
-    headers = {"Content-Type": "application/json", "Agent-Type": "PromptCenter", "X-Language": "en-us"}
+    headers = {"Content-Type": "application/json", "Agent-Type": "PromptCenter", "X-Language": "zh-cn"}
+    if extra_headers:
+        headers.update(extra_headers)
     payload = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8") if body is not None else b""
-    signed = sign_request(method, url, headers, payload, credential, include_host=False)
+    signed = sign_request(method, url, headers, payload, credential, include_host=True)
     response = request(method, url, headers=signed, data=payload if body is not None else None, timeout=20)
     text = response.text[:300]
-    if response.status_code != 200:
+    if not 200 <= response.status_code < 300:
         raise RuntimeError("ops 接口返回 HTTP %s: %s%s" % (response.status_code, text, benefit_hint(text)))
     parsed = json_of(response)
-    if parsed.get("code") != 0:
-        raise RuntimeError("ops 接口未确认成功（需要 code=0，实际 %s）%s" % (parsed.get("code"), benefit_hint(text)))
-    return parsed.get("data")
+    code = parsed.get("code") if isinstance(parsed, dict) else None
+    if str(code) not in ("0", "200"):
+        raise RuntimeError("ops 接口未确认成功（需要 code=0/200，实际 %s）%s"
+                           % (code, benefit_hint(text)))
+    if isinstance(parsed, dict):
+        data_value = parsed.get("data")
+        result_value = parsed.get("result")
+        if isinstance(data_value, (dict, list)) and data_value:
+            return data_value
+        if result_value is not None:
+            return result_value
+        if data_value is not None:
+            return data_value
+    return {}
 
 
 def benefit_hint(text):
@@ -617,7 +633,9 @@ def benefit_hint(text):
 
 
 def fetch_deliveries(credential):
-    data = welfare_request(credential, "GET", DELIVERY_PATH)
+    data = welfare_request(
+        credential, "GET", DELIVERY_PATH,
+        extra_headers={"x-snap-traceid": str(uuid.uuid4())})
     items = data.get("items") if isinstance(data, dict) else None
     if not isinstance(items, list):
         raise RuntimeError("福利接口没有返回 items 字段")
@@ -632,6 +650,8 @@ def fetch_deliveries(credential):
             "title": item.get("title") or "",
             "claimable": item.get("claimable") is True,
             "status": item.get("status") or "",
+            "benefitId": first_text(item.get("userBenefitId"), item.get("user_benefit_id"),
+                                    item.get("benefitId"), item.get("benefit_id")),
             "amount": item.get("benefitAmount") or 0,
             "unit": item.get("benefitUnit") or "",
         })
@@ -657,12 +677,40 @@ def has_work(campaign):
 
 
 def claim_one(credential, campaign, idempotent_key):
-    """领一笔（campaignId 原样带回，不改类型）；响应 id 对不上就不进入 confirm 阶段。"""
+    """领取一笔并返回 confirm 所需的 userBenefitId。"""
     data = welfare_request(credential, "POST", CLAIM_PATH,
-                           {"campaignId": campaign["id"], "idempotentKey": idempotent_key, "channel": "IDE"})
-    returned = str(data.get("campaignId")) if isinstance(data, dict) else ""
-    if returned != campaign["key"]:
-        raise RuntimeError("领取响应活动 ID 不匹配（要 %s，回 %s），未进入确认阶段" % (campaign["key"], returned))
+                           {"campaignId": campaign["id"], "idempotentKey": idempotent_key,
+                            "channel": OPS_CHANNEL})
+    if not isinstance(data, dict):
+        raise RuntimeError("领取响应缺少对象数据，未进入确认阶段")
+    returned = first_text(data.get("campaignId"), data.get("campaign_id"))
+    if returned and returned != campaign["key"]:
+        raise RuntimeError("领取响应活动 ID 不匹配（要 %s，回 %s），未进入确认阶段"
+                           % (campaign["key"], returned))
+    benefit_id = first_text(data.get("userBenefitId"), data.get("user_benefit_id"),
+                            data.get("benefitId"), data.get("benefit_id"), data.get("id"))
+    if not benefit_id:
+        raise RuntimeError("领取响应缺少 userBenefitId，无法安全确认到账")
+    return benefit_id
+
+
+def confirm_one(credential, user_benefit_id):
+    """按最新桌面客户端协议确认领取记录。"""
+    return welfare_request(credential, "POST", CONFIRM_PATH,
+                           {"userBenefitId": user_benefit_id})
+
+
+def confirm_campaign(credential, campaign, progress):
+    """确认一条已领取记录；缺少 userBenefitId 时拒绝猜测或重放 claim。"""
+    benefit_id = first_text(progress.get("userBenefitId"))
+    if not benefit_id:
+        raise RuntimeError(
+            "%s 已领取但台账缺少 userBenefitId；为避免重复领取，"
+            "本次不重放 claim，也不会用 campaignId 冒充确认 ID"
+            % display_title(campaign))
+    confirm_one(credential, benefit_id)
+    progress["confirmedRequested"] = True
+    return benefit_id
 
 
 def do_checkin(credential):
@@ -714,18 +762,23 @@ def do_checkin(credential):
         progress = ledger["campaigns"].get(key) or {}
         if item["status"] == "CLAIMED":
             progress["claimed"] = True
+            if item.get("benefitId") and not progress.get("userBenefitId"):
+                progress["userBenefitId"] = item["benefitId"]
         if not progress.get("claimed") and item["claimable"]:
             if not progress.get("idempotentKey"):
-                progress["idempotentKey"] = "claim_%s_%d" % (key, now_ms)
+                progress["idempotentKey"] = str(uuid.uuid4())
             ledger["campaigns"][key] = progress
             persist_ledger(store, identity, ledger)
-            claim_one(credential, item, progress["idempotentKey"])
+            benefit_id = claim_one(credential, item, progress["idempotentKey"])
             progress["claimed"] = True
+            progress["userBenefitId"] = benefit_id
             ledger["campaigns"][key] = progress
             persist_ledger(store, identity, ledger)
         if progress.get("claimed"):
             # 已领但未确认：只补 confirm，不重复发 claim
-            welfare_request(credential, "POST", CONFIRM_PATH, {"campaignId": item["id"]})
+            confirm_campaign(credential, item, progress)
+            ledger["campaigns"][key] = progress
+            persist_ledger(store, identity, ledger)
         submitted.append(item)
         time.sleep(1.0)
 
