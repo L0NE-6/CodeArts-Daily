@@ -1,5 +1,14 @@
 # 更新日志
 
+## v1.0.4（2026-10-29）
+
+- `save_store` 不再吞掉凭据写入异常：改为临时文件 + `os.replace` 原子落盘，失败时抛出 `CredentialStoreError`，避免半截文件覆盖旧凭据。
+- 续期成功后若新凭据落盘失败，账号立即标记终态并抛出 `TerminalCredentialError`：服务端已消耗一次性 `refresh_token`，本地旧 token 永久失效，继续重试只会得到 `STS5.1806`，必须重新登录。
+- `STS5.1806`（`error_code` / `error_msg` 两条腿）以及 `refresh token has been used` 归为终态；终态标记写入 `codearts_credentials.json`，后续运行直接跳过该账号。
+- `ensure_fresh` 不再把终态异常吞成「自动续期失败后继续用旧凭据」；主流程单独报告「终态：需重新登录」。
+- 成功续期路径保持不变；新增 8 项离线回归测试，覆盖写盘失败、STS5.1806 两条报文腿、成功续期与普通 5xx 非终态，测试总数 13 项。
+- 实证来源：[iJetLi/dsh-providers-hub@7167acb0](https://github.com/iJetLi/dsh-providers-hub/commit/7167acb0)。
+
 ## v1.0.3（2026-10-22）
 
 - 福利列表与领取渠道从 `IDE` 切换到桌面客户端口径 `DESKTOP`，并按桌面客户端方式签名包含 `Host`。

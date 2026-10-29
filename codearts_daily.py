@@ -89,6 +89,14 @@ NO_NOTIFY = False
 FORCE = False
 
 
+class CredentialStoreError(RuntimeError):
+    """凭据存储写入失败（权限 / 磁盘 / 序列化）。"""
+
+
+class TerminalCredentialError(RuntimeError):
+    """凭据已终态失效，必须重新登录；调用方不得把它当普通异常重试。"""
+
+
 def log(msg):
     print("%s %s" % (time.strftime("[%H:%M:%S]"), msg), flush=True)
 
@@ -361,11 +369,24 @@ def load_store():
 
 
 def save_store(store):
+    """原子写入凭据存储；任何写入失败都必须抛给调用方。
+
+    旧实现把异常吞成一行日志：续期接口已经消耗一次性 refresh_token 后，
+    新凭据只剩内存引用，进程退出即永久丢失，下一轮继续拿旧 token 兑换。
+    """
+    tmp = STORE_FILE + ".tmp"
     try:
-        with open(STORE_FILE, "w", encoding="utf-8") as handle:
+        with open(tmp, "w", encoding="utf-8") as handle:
             json.dump(store, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, STORE_FILE)
     except Exception as error:
-        log("⚠️ 凭据存储写入失败: %s" % error)
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise CredentialStoreError("凭据存储写入失败: %s" % error) from error
 
 
 def apply_store(credential):
@@ -373,7 +394,8 @@ def apply_store(credential):
     if not isinstance(saved, dict):
         return False
     for key in ("access_key_id", "secret_access_key", "security_token", "expiration",
-                "refresh_token", "domain_id", "user_name", "code_verifier"):
+                "refresh_token", "domain_id", "user_name", "code_verifier",
+                "terminal", "terminal_reason"):
         if saved.get(key):
             credential[key] = saved[key]
     if isinstance(saved.get("dpop_jwk"), dict) and saved["dpop_jwk"]:
@@ -385,7 +407,8 @@ def persist(credential):
     store = load_store()
     store[identity_of(credential)] = {key: credential.get(key) for key in (
         "access_key_id", "secret_access_key", "security_token", "expiration",
-        "refresh_token", "domain_id", "user_name", "code_verifier")}
+        "refresh_token", "domain_id", "user_name", "code_verifier",
+        "terminal", "terminal_reason")}
     store[identity_of(credential)]["dpop_jwk"] = credential.get("dpop_jwk") or {}
     store[identity_of(credential)]["at"] = int(time.time())
     save_store(store)
@@ -442,6 +465,33 @@ def dpop_proof(jwk, method, url):
     return "%s.%s" % (signing_input, b64url(raw))
 
 
+def refresh_token_terminal(payload, raw_text=""):
+    """一次性 refresh_token 的终态判据；返回病因，非终态返回空串。
+
+    STS5.1806 是「token 已被兑换过」的专属错误码；error_code / error_msg 两条
+    腿都要认，避免上游只改其中一条时再次把死号当可重试异常。
+    """
+    text = json.dumps(payload, ensure_ascii=False) if isinstance(payload, dict) else ""
+    text = (text + " " + str(raw_text or "")).replace("\\", "").lower()
+    if "sts5.1806" in text:
+        return "STS5.1806"
+    if "refresh token has been used" in text:
+        return "refresh_token_used"
+    if "expiredrefreshtoken" in text:
+        return "invalid_grant"
+    if isinstance(payload, dict) and payload.get("error") == "invalid_grant":
+        return "invalid_grant"
+    return ""
+
+
+def mark_terminal(credential, reason):
+    """把账号标成终态并落盘；写盘失败由调用方转换成终态错误。"""
+    credential["terminal"] = True
+    credential["terminal_reason"] = reason
+    persist(credential)
+    return credential
+
+
 def refresh_credential(credential):
     if not credential.get("refresh_token") or not credential.get("code_verifier"):
         raise RuntimeError("凭据缺少 refresh_token 或 code_verifier，无法续期")
@@ -461,8 +511,19 @@ def refresh_credential(credential):
                        data=form, timeout=30)
     payload = json_of(response)
     if response.status_code < 200 or response.status_code >= 300:
-        detail = first_text(payload.get("error_description"), payload.get("error"),
+        detail = first_text(payload.get("error_code"), payload.get("error_msg"),
+                            payload.get("error_description"), payload.get("error"),
                             payload.get("message")) or ("HTTP %s" % response.status_code)
+        reason = refresh_token_terminal(payload, getattr(response, "text", ""))
+        if reason:
+            try:
+                mark_terminal(credential, reason)
+            except Exception as store_error:
+                raise TerminalCredentialError(
+                    "刷新令牌已失效（%s），需重新登录；终态标记落盘失败：%s"
+                    % (reason, store_error)) from store_error
+            raise TerminalCredentialError(
+                "刷新令牌已失效（%s），需重新登录：%s" % (reason, detail))
         raise RuntimeError("令牌请求被拒: %s" % detail)
     data = payload.get("credentials") if isinstance(payload.get("credentials"), dict) else payload
 
@@ -484,17 +545,35 @@ def refresh_credential(credential):
         raise RuntimeError("令牌响应缺少 AK/SK/STS")
     for key in ("domain_id", "user_name", "code_verifier", "dpop_jwk", "note"):
         fresh[key] = credential.get(key, "" if key != "dpop_jwk" else {})
-    persist(fresh)
+    try:
+        persist(fresh)
+    except Exception as error:
+        # 服务端已消耗旧的一次性 refresh_token；新凭据只存在内存里，
+        # 进程退出就永久丢失，下一轮必然拿旧 token 换回 STS5.1806。
+        credential["terminal"] = True
+        credential["terminal_reason"] = "refresh_persist_failed"
+        fresh["terminal"] = True
+        fresh["terminal_reason"] = "refresh_persist_failed"
+        log("   ⚠️ 续期成功但凭据落盘失败，账号标记为终态: %s" % error)
+        raise TerminalCredentialError(
+            "续期成功但新凭据落盘失败：refresh_token 已在服务端被消耗，"
+            "本地旧 token 已失效，必须重新登录。落盘错误：%s" % error) from error
     log("   🔄 凭据已续期并保存")
     return fresh
 
 
 def ensure_fresh(credential):
+    if credential.get("terminal"):
+        raise TerminalCredentialError(
+            "凭据已标记终态（%s），需重新登录"
+            % (credential.get("terminal_reason") or "unknown"))
     if not expires_within(credential, REFRESH_LEAD_SECONDS):
         return credential
     if credential.get("refresh_token") and credential.get("code_verifier") and (credential.get("dpop_jwk") or {}).get("d"):
         try:
             return refresh_credential(credential)
+        except TerminalCredentialError:
+            raise
         except Exception as error:
             log("   ⚠️ 自动续期失败: %s" % error)
             return credential
@@ -943,10 +1022,19 @@ def main():
             continue
         apply_store(credential)
         log("👤 [%d] %s  AK=%s" % (index, credential["note"], mask(credential["access_key_id"])))
+        if credential.get("terminal"):
+            message = "终态：凭据已失效（%s），需重新登录" % (
+                credential.get("terminal_reason") or "unknown")
+            log("   ⛔ %s" % message)
+            report.append("账号%d %s: ⛔ %s" % (index, credential["note"], message))
+            continue
         try:
             success, message, _ = do_checkin(credential)
             log("   %s %s" % ("✅" if success else "ℹ️", message))
             report.append("账号%d %s: %s %s" % (index, credential["note"], "✅" if success else "ℹ️", message))
+        except TerminalCredentialError as error:
+            log("   ⛔ 终态: %s" % error)
+            report.append("账号%d %s: ⛔ 终态: %s" % (index, credential["note"], error))
         except Exception as error:
             log("   ❌ 异常: %s" % error)
             report.append("账号%d %s: ❌ %s" % (index, credential["note"], error))
