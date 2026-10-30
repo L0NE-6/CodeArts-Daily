@@ -97,6 +97,10 @@ class TerminalCredentialError(RuntimeError):
     """凭据已终态失效，必须重新登录；调用方不得把它当普通异常重试。"""
 
 
+class SessionExpiredError(TerminalCredentialError):
+    """CodeArts 会话已过期（HTTP 200 + 空 body），必须重新登录。"""
+
+
 def log(msg):
     print("%s %s" % (time.strftime("[%H:%M:%S]"), msg), flush=True)
 
@@ -682,9 +686,15 @@ def welfare_request(credential, method, path, body=None, extra_headers=None):
     payload = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8") if body is not None else b""
     signed = sign_request(method, url, headers, payload, credential, include_host=True)
     response = request(method, url, headers=signed, data=payload if body is not None else None, timeout=20)
-    text = response.text[:300]
+    raw_text = response.text or ""
+    text = raw_text[:300]
     if not 200 <= response.status_code < 300:
         raise RuntimeError("ops 接口返回 HTTP %s: %s%s" % (response.status_code, text, benefit_hint(text)))
+    # 实测：CodeArts 会话过期时 ops 接口会返回 HTTP 200 + 空 body（不是 401）。
+    # 这不是成功，也不能按普通异常无限重试——必须按终态让用户重新登录。
+    if not raw_text.strip():
+        raise SessionExpiredError(
+            "CodeArts 会话已过期（ops 接口返回 HTTP 200 空响应），需重新登录")
     parsed = json_of(response)
     code = parsed.get("code") if isinstance(parsed, dict) else None
     if str(code) not in ("0", "200"):
@@ -1032,6 +1042,13 @@ def main():
             success, message, _ = do_checkin(credential)
             log("   %s %s" % ("✅" if success else "ℹ️", message))
             report.append("账号%d %s: %s %s" % (index, credential["note"], "✅" if success else "ℹ️", message))
+        except SessionExpiredError as error:
+            try:
+                mark_terminal(credential, "session_expired")
+            except Exception as store_error:
+                log("   ⚠️ 会话过期但终态标记落盘失败: %s" % store_error)
+            log("   ⛔ 终态: %s" % error)
+            report.append("账号%d %s: ⛔ 终态: %s" % (index, credential["note"], error))
         except TerminalCredentialError as error:
             log("   ⛔ 终态: %s" % error)
             report.append("账号%d %s: ⛔ 终态: %s" % (index, credential["note"], error))

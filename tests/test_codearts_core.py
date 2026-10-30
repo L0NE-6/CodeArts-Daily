@@ -296,6 +296,39 @@ class CodeArtsCoreTests(unittest.TestCase):
         with self.assertRaisesRegex(module["TerminalCredentialError"], "STS5.1806"):
             module["ensure_fresh"](credential)
 
+    def test_welfare_request_empty_200_body_is_session_expired(self):
+        module = load_functions(
+            "TerminalCredentialError", "SessionExpiredError", "welfare_request",
+            BASE="https://example.test",
+            sign_request=lambda method, url, headers, body_bytes, credential,
+            include_host=False: dict(headers, Authorization="signed"),
+            request=lambda *args, **kwargs: FakeResponse(
+                status_code=200, payload={}, text=""),
+            json_of=lambda response: response.payload,
+            benefit_hint=lambda text: "",
+            json=json,
+        )
+        with self.assertRaisesRegex(
+                module["SessionExpiredError"], "HTTP 200 空响应"):
+            module["welfare_request"]({}, "GET", "/v1/ops/delivery?channel=DESKTOP")
+
+    def test_welfare_request_401_is_not_classified_as_session_expired(self):
+        module = load_functions(
+            "TerminalCredentialError", "SessionExpiredError", "welfare_request",
+            BASE="https://example.test",
+            sign_request=lambda method, url, headers, body_bytes, credential,
+            include_host=False: dict(headers, Authorization="signed"),
+            request=lambda *args, **kwargs: FakeResponse(
+                status_code=401, payload={}, text=""),
+            json_of=lambda response: response.payload,
+            benefit_hint=lambda text: "",
+            json=json,
+        )
+        with self.assertRaises(RuntimeError) as caught:
+            module["welfare_request"]({}, "GET", "/v1/ops/delivery?channel=DESKTOP")
+        self.assertNotIsInstance(caught.exception, module["SessionExpiredError"])
+        self.assertIn("HTTP 401", str(caught.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,5 +1,11 @@
 # 更新日志
 
+## v1.0.5（2026-10-30）
+
+- 福利 ops 接口新增「HTTP 200 + 空 body = 会话过期」判定：CodeArts 在登录态失效时可能不回 401，而是 200 空响应；旧逻辑会在 `response.json()` 处抛解析异常，无法把账号落到终态，后续每轮继续用坏会话重试。
+- 空响应现在抛 `SessionExpiredError`（`TerminalCredentialError` 子类），主流程把账号标记为 `session_expired` 并提示重新登录；401/403 仍按原逻辑处理，不误判为会话过期。
+- 新增 2 项离线回归测试：200 空 body 必须终态、401 不得归类为 `SessionExpiredError`；测试总数 15 项。
+
 ## v1.0.4（2026-10-29）
 
 - `save_store` 不再吞掉凭据写入异常：改为临时文件 + `os.replace` 原子落盘，失败时抛出 `CredentialStoreError`，避免半截文件覆盖旧凭据。

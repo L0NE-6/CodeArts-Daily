@@ -159,7 +159,7 @@ CodeArts-Daily/
 
 ## 📦 版本与发布
 
-- 当前版本：`v1.0.4`（2026-10-29）。
+- 当前版本：`v1.0.5`（2026-10-30）。
 - 每次更新单独发一个 Release：`v1.0.0` → `v1.0.1` …，历史版本保留可下载。
 - 每个 Release 附带：完整包 zip + 各脚本单文件 + `SHA256SUMS.txt`。
 - 下载页：<https://github.com/L0NE-6/CodeArts-Daily/releases>
