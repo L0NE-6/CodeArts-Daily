@@ -4,6 +4,8 @@ CodeArts の日次特典と一度限りの新規登録特典を自動取得し�
 
 [简体中文](../README.md) · [English](README.en.md) · [繁體中文](README.zh-Hant.md) · [日本語](README.ja.md) · [한국어](README.ko.md) · [Português (BR)](README.pt-BR.md)
 
+**現在のバージョン：** v1.0.6
+
 完全な中国語ドキュメントは [../README.md](../README.md) を参照してください。
 
 ## 主な機能

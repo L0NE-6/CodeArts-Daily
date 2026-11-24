@@ -4,6 +4,8 @@ Automatiza os benefícios diários do CodeArts e o presente único de cadastro. 
 
 [简体中文](../README.md) · [English](README.en.md) · [繁體中文](README.zh-Hant.md) · [日本語](README.ja.md) · [한국어](README.ko.md) · [Português (BR)](README.pt-BR.md)
 
+**Versão atual:** v1.0.6
+
 A documentação completa em chinês está em [../README.md](../README.md).
 
 ## Recursos

@@ -4,6 +4,8 @@ CodeArts 일일 혜택과 일회성 신규 가입 보상을 자동으로 받습�
 
 [简体中文](../README.md) · [English](README.en.md) · [繁體中文](README.zh-Hant.md) · [日本語](README.ja.md) · [한국어](README.ko.md) · [Português (BR)](README.pt-BR.md)
 
+**현재 버전:** v1.0.6
+
 전체 중국어 문서는 [../README.md](../README.md)에서 확인하세요.
 
 ## 주요 기능
